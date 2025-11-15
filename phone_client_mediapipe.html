@@ -49,144 +49,145 @@
     (WebSocket은 나중에 ESP32/노트북 연동용이라, 지금은 연결 안 해도 얼굴 인식은 잘 됩니다)
   </div>
 
-<script>
-const videoElement  = document.getElementById('video');
-const canvasElement = document.getElementById('canvas');
-const canvasCtx     = canvasElement.getContext('2d');
+<script type="module">
+  const videoElement  = document.getElementById('video');
+  const canvasElement = document.getElementById('canvas');
+  const canvasCtx     = canvasElement.getContext('2d');
 
-const wsInput    = document.getElementById('ws');
-const connectBtn = document.getElementById('connectBtn');
-const statusSpan = document.getElementById('status');
-const angleText  = document.getElementById('angleText');
-const mirrorChk  = document.getElementById('mirror');
-const alphaInput = document.getElementById('alpha');
-const deadInput  = document.getElementById('dead');
+  const wsInput    = document.getElementById('ws');
+  const connectBtn = document.getElementById('connectBtn');
+  const statusSpan = document.getElementById('status');
+  const angleText  = document.getElementById('angleText');
+  const mirrorChk  = document.getElementById('mirror');
+  const alphaInput = document.getElementById('alpha');
+  const deadInput  = document.getElementById('dead');
 
-let lastAngle = 90;
-let lastSend  = 0;
-let socket    = null;
+  // ✅ Mediapipe drawing 함수들이 window에 올라가 있어서 이렇게 받아야 함
+  const drawingUtils = window;
 
-// WebSocket 연결/해제 버튼
-connectBtn.onclick = () => {
-  if (socket && socket.readyState === 1) {
-    socket.close();
-    return;
-  }
-  const url = wsInput.value.trim();
-  if (!url) { alert("ws://<laptop_ip>:8765 형식으로 입력"); return; }
-  socket = new WebSocket(url);
-  socket.onopen  = () => { statusSpan.textContent = "연결됨"; connectBtn.textContent = "끊기"; };
-  socket.onclose = () => { statusSpan.textContent = "끊어짐"; connectBtn.textContent = "연결"; };
-  socket.onerror = () => { statusSpan.textContent = "오류"; };
-};
+  let lastAngle = 90;
+  let lastSend  = 0;
+  let socket    = null;
 
-// 각도 전송 (ESP32/노트북 용)
-function sendAngle(angle){
-  const now = performance.now();
-  if (!socket || socket.readyState !== 1) return;
-  if (now - lastSend < 80) return; // 약 12Hz
-  lastSend = now;
-  const payload = JSON.stringify({
-    type: "angle",
-    value: Math.round(angle),
-    ts: Date.now()
-  });
-  socket.send(payload);
-}
+  // ───────────────── WebSocket 연결 버튼 ─────────────────
+  connectBtn.onclick = () => {
+    if (socket && socket.readyState === 1) {
+      socket.close();
+      return;
+    }
+    const url = wsInput.value.trim();
+    if (!url) { alert("ws://<laptop_ip>:8765 형식으로 입력"); return; }
+    socket = new WebSocket(url);
+    socket.onopen  = () => { statusSpan.textContent = "연결됨"; connectBtn.textContent = "끊기"; };
+    socket.onclose = () => { statusSpan.textContent = "끊어짐"; connectBtn.textContent = "연결"; };
+    socket.onerror = () => { statusSpan.textContent = "오류"; };
+  };
 
-// MediaPipe 결과 처리
-function onResults(results) {
-  const alpha = parseFloat(alphaInput.value);
-  const dead  = parseFloat(deadInput.value);
-
-  // 배경 지우고 현재 프레임 그림
-  canvasCtx.save();
-  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-  canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-
-  const detections = results.detections;
-  if (detections && detections.length > 0) {
-    // 가장 큰 얼굴 하나 고르기 (가까운 사람)
-    let best = detections[0];
-    let bestArea = 0;
-    detections.forEach(det => {
-      const b = det.boundingBox;
-      const w = b.width * canvasElement.width;
-      const h = b.height * canvasElement.height;
-      const area = w * h;
-      if (area > bestArea) { bestArea = area; best = det; }
+  // ───────────────── 각도 전송 ─────────────────
+  function sendAngle(angle){
+    const now = performance.now();
+    if (!socket || socket.readyState !== 1) return;
+    if (now - lastSend < 80) return; // 약 12Hz
+    lastSend = now;
+    const payload = JSON.stringify({
+      type: "angle",
+      value: Math.round(angle),
+      ts: Date.now()
     });
-
-    const box = best.boundingBox;
-
-    // 빨간 박스 그리기
-    drawingUtils.drawRectangle(
-      canvasCtx,
-      box,
-      {color: 'red', lineWidth: 4, fillColor: '#00000000'}
-    );
-
-    // 중심 x 좌표(정규화 0~1) 가져오기
-    let cxNorm;
-    if (typeof box.xCenter === 'number') {
-      cxNorm = box.xCenter; // 이미 0~1
-    } else {
-      cxNorm = (box.xmin || 0) + (box.width || 0) / 2;
-    }
-
-    // 미러 옵션: 체크되어 있으면 좌우 반전해서 각도 계산
-    if (mirrorChk.checked) {
-      cxNorm = 1.0 - cxNorm;
-    }
-
-    // 0~1 위치를 0~180도로 변환
-    let desired = cxNorm * 180;
-
-    // 가운데 근처(데드밴드)는 움직임 무시
-    if (Math.abs(cxNorm - 0.5) < dead) {
-      desired = lastAngle;
-    }
-
-    // 부드럽게 보간
-    const smooth = lastAngle + alpha * (desired - lastAngle);
-    lastAngle = smooth;
-
-    angleText.textContent = Math.round(smooth);
-    sendAngle(smooth);
+    socket.send(payload);
   }
 
-  canvasCtx.restore();
-}
+  // ───────────────── Mediapipe 결과 콜백 ─────────────────
+  function onResults(results) {
+    const alpha = parseFloat(alphaInput.value);
+    const dead  = parseFloat(deadInput.value);
 
-// ✅ 여기서가 중요 포인트였어:
-// faceDetection 라이브러리가 전역으로 `faceDetection` 이라는 이름으로 올라가는데
-// 내가 이전 코드에서 `new FaceDetection.FaceDetection` 이렇게 잘못 썼었음.
+    // 배경 지우고 현재 프레임 그림
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
 
-const fd = new faceDetection.FaceDetection({
-  locateFile: (file) => {
-    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`;
+    const detections = results.detections;
+    if (detections && detections.length > 0) {
+      // 가장 큰 얼굴 하나 고르기
+      let best = detections[0];
+      let bestArea = 0;
+      detections.forEach(det => {
+        const b = det.boundingBox;
+        const w = b.width * canvasElement.width;
+        const h = b.height * canvasElement.height;
+        const area = w * h;
+        if (area > bestArea) { bestArea = area; best = det; }
+      });
+
+      const box = best.boundingBox;
+
+      // 빨간 박스 그리기 (Mediapipe 방식 그대로 사용)
+      drawingUtils.drawRectangle(
+        canvasCtx,
+        box,
+        {color: 'red', lineWidth: 4, fillColor: '#00000000'}
+      );
+
+      // 중심 x 좌표(정규화 0~1)
+      let cxNorm;
+      if (typeof box.xCenter === 'number') {
+        cxNorm = box.xCenter;
+      } else {
+        cxNorm = (box.xmin || 0) + (box.width || 0) / 2;
+      }
+
+      // 미러 체크되어 있으면 좌우 반전해서 각도 계산
+      if (mirrorChk.checked) {
+        cxNorm = 1.0 - cxNorm;
+      }
+
+      // 0~1 위치를 0~180도로 변환
+      let desired = cxNorm * 180;
+
+      // 가운데 근처(데드밴드)는 움직임 무시
+      if (Math.abs(cxNorm - 0.5) < dead) {
+        desired = lastAngle;
+      }
+
+      // 부드럽게 보간
+      const smooth = lastAngle + alpha * (desired - lastAngle);
+      lastAngle = smooth;
+
+      angleText.textContent = Math.round(smooth);
+      sendAngle(smooth);
+    }
+
+    canvasCtx.restore();
   }
-});
 
-// 옵션: short 모델 + 셀피 모드 끔(우리가 따로 미러 처리)
-fd.setOptions({
-  model: 'short',              // 가까운 얼굴용 (멀리면 'full'도 가능)
-  selfieMode: false,           // 따로 미러 처리할 거라 false
-  minDetectionConfidence: 0.6  // 신뢰도 높일수록 더 확실한 얼굴만 잡음
-});
+  // ───────────────── Mediapipe FaceDetection 설정 ─────────────────
+  const faceDet = new FaceDetection({
+    locateFile: (file) => {
+      // 공식 예제와 동일한 CDN 경로
+      return `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.0/${file}`;
+    }
+  });
 
-fd.onResults(onResults);
+  faceDet.setOptions({
+    model: 'short',              // 가까운 얼굴 위주
+    selfieMode: false,           // 우리는 따로 미러 처리
+    minDetectionConfidence: 0.6  // 신뢰도
+  });
 
-// 카메라 시작
-const camera = new Camera(videoElement, {
-  onFrame: async () => {
-    await fd.send({image: videoElement});
-  },
-  width: 640,
-  height: 480
-});
+  faceDet.onResults(onResults);
 
-camera.start();
+  // ───────────────── 카메라 시작 ─────────────────
+  const camera = new Camera(videoElement, {
+    onFrame: async () => {
+      await faceDet.send({image: videoElement});
+    },
+    width: 640,
+    height: 480
+  });
+
+  camera.start();
 </script>
+
 </body>
 </html>
