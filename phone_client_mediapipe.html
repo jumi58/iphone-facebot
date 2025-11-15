@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Phone Client — MediaPipe Face Angle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- MediaPipe JS 라이브러리들 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js" crossorigin="anonymous"></script>
+
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    video { display:none; }
+    canvas { width: 100%; max-width: 480px; height: auto; background: #000; border-radius: 8px; }
+    .row { margin: 8px 0; }
+    .hint { color: #666; font-size: 12px; }
+    .angle { font-size: 22px; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h3>📱 Phone Client — MediaPipe Face Angle</h3>
+
+  <div class="row">
+    WebSocket 서버(노트북 IP):
+    <input id="ws" placeholder="ws://<laptop_ip>:8765" style="width: 260px;" />
+    <button id="connectBtn">연결</button>
+    <span id="status" class="hint"></span>
+  </div>
+
+  <!-- 카메라 영상은 video에 받고, 그걸 canvas에 그림 -->
+  <video class="input_video" id="video" playsinline></video>
+  <canvas class="output_canvas" id="canvas" width="640" height="480"></canvas>
+
+  <div class="row">
+    <label><input type="checkbox" id="mirror" checked> 미러 보기(셀카처럼)</label>
+    <label style="margin-left:12px;">민감도 α:
+      <input type="range" id="alpha" min="0.05" max="0.6" step="0.01" value="0.25">
+    </label>
+    <label style="margin-left:12px;">데드밴드:
+      <input type="range" id="dead" min="0" max="0.1" step="0.005" value="0.02">
+    </label>
+  </div>
+
+  <div class="angle">ANGLE: <span id="angleText">--</span>°</div>
+  <div class="hint">
+    같은 Wi-Fi에 있는 노트북 IP를 입력 후 연결하세요. 예: <b>ws://192.168.0.15:8765</b><br>
+    (WebSocket은 나중에 ESP32/노트북 연동용이라, 지금은 연결 안 해도 얼굴 인식은 잘 됩니다)
+  </div>
+
+<script>
+const videoElement  = document.getElementById('video');
+const canvasElement = document.getElementById('canvas');
+const canvasCtx     = canvasElement.getContext('2d');
+
+const wsInput    = document.getElementById('ws');
+const connectBtn = document.getElementById('connectBtn');
+const statusSpan = document.getElementById('status');
+const angleText  = document.getElementById('angleText');
+const mirrorChk  = document.getElementById('mirror');
+const alphaInput = document.getElementById('alpha');
+const deadInput  = document.getElementById('dead');
+
+let lastAngle = 90;
+let lastSend  = 0;
+let socket    = null;
+
+// WebSocket 연결/해제 버튼
+connectBtn.onclick = () => {
+  if (socket && socket.readyState === 1) {
+    socket.close();
+    return;
+  }
+  const url = wsInput.value.trim();
+  if (!url) { alert("ws://<laptop_ip>:8765 형식으로 입력"); return; }
+  socket = new WebSocket(url);
+  socket.onopen  = () => { statusSpan.textContent = "연결됨"; connectBtn.textContent = "끊기"; };
+  socket.onclose = () => { statusSpan.textContent = "끊어짐"; connectBtn.textContent = "연결"; };
+  socket.onerror = () => { statusSpan.textContent = "오류"; };
+};
+
+// 각도 전송 (ESP32/노트북 용)
+function sendAngle(angle){
+  const now = performance.now();
+  if (!socket || socket.readyState !== 1) return;
+  if (now - lastSend < 80) return; // 약 12Hz
+  lastSend = now;
+  const payload = JSON.stringify({
+    type: "angle",
+    value: Math.round(angle),
+    ts: Date.now()
+  });
+  socket.send(payload);
+}
+
+// MediaPipe 결과 처리
+function onResults(results) {
+  const alpha = parseFloat(alphaInput.value);
+  const dead  = parseFloat(deadInput.value);
+
+  // 배경 지우고 현재 프레임 그림
+  canvasCtx.save();
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+  const detections = results.detections;
+  if (detections && detections.length > 0) {
+    // 가장 큰 얼굴 하나 고르기 (가까운 사람)
+    let best = detections[0];
+    let bestArea = 0;
+    detections.forEach(det => {
+      const b = det.boundingBox;
+      const w = b.width * canvasElement.width;
+      const h = b.height * canvasElement.height;
+      const area = w * h;
+      if (area > bestArea) { bestArea = area; best = det; }
+    });
+
+    const box = best.boundingBox;
+
+    // 빨간 박스 그리기
+    drawingUtils.drawRectangle(
+      canvasCtx,
+      box,
+      {color: 'red', lineWidth: 4, fillColor: '#00000000'}
+    );
+
+    // 중심 x 좌표(정규화 0~1) 가져오기
+    let cxNorm;
+    if (typeof box.xCenter === 'number') {
+      cxNorm = box.xCenter; // 이미 0~1
+    } else {
+      // xmin + width/2 형태일 수도 있어서 대비
+      cxNorm = (box.xmin || 0) + (box.width || 0) / 2;
+    }
+
+    // 미러 옵션: 좌우 반전
+    if (!mirrorChk.checked) {
+      // 미러 체크를 끄면 실제 화면 기준으로 사용
+      // (셀카처럼 보이게 하고 싶으면 체크 on 상태 유지)
+    } else {
+      // 화면이 좌우 뒤집혀 보이는 경우 → 각도도 반대로
+      cxNorm = 1.0 - cxNorm;
+    }
+
+    // 0~1 위치를 0~180도로 변환
+    let desired = cxNorm * 180;
+
+    // 가운데 근처(데드밴드)는 움직임 무시
+    if (Math.abs(cxNorm - 0.5) < dead) {
+      desired = lastAngle;
+    }
+
+    // 부드럽게 보간
+    const smooth = lastAngle + alpha * (desired - lastAngle);
+    lastAngle = smooth;
+
+    angleText.textContent = Math.round(smooth);
+    sendAngle(smooth);
+  } else {
+    // 얼굴 없을 때는 그냥 이전 화면 유지
+  }
+
+  canvasCtx.restore();
+}
+
+// MediaPipe FaceDetection 설정
+const faceDetection = new FaceDetection.FaceDetection({
+  locateFile: (file) => {
+    // 라이브러리 파일 CDN에서 로드
+    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${file}`;
+  }
+});
+
+// 옵션: short 모델 + 셀피 모드 + 신뢰도
+faceDetection.setOptions({
+  model: 'short',              // 가까운 얼굴용 (멀리면 'full'도 가능)
+  selfieMode: true,            // 카메라 셀피모드 (좌우 반전)
+  minDetectionConfidence: 0.6  // 신뢰도 높일수록 더 확실한 얼굴만 잡음
+});
+
+faceDetection.onResults(onResults);
+
+// 카메라 시작
+const camera = new Camera(videoElement, {
+  onFrame: async () => {
+    await faceDetection.send({image: videoElement});
+  },
+  width: 640,
+  height: 480
+});
+
+camera.start();
+</script>
+</body>
+</html>
