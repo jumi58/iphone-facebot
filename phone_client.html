@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Phone Camera → Laptop (WebSocket)</title>
+  <title>Phone Camera → Laptop (OpenCV.js)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
   <style>
@@ -14,10 +14,10 @@
   </style>
 </head>
 <body>
-  <h3>📱 Phone Client — Face Angle Sender</h3>
+  <h3>📱 Phone Client — Face Angle Sender (Stabilized)</h3>
   <div class="row">
     WebSocket 서버(노트북 IP): 
-    <input id="ws" placeholder="ws://<laptop_ip>:8765" style="width: 260px;" />
+    <input id="ws" placeholder="ws://&lt;laptop_ip&gt;:8765" style="width: 260px;" />
     <button id="connectBtn">연결</button>
     <span id="status" class="hint"></span>
   </div>
@@ -27,38 +27,55 @@
 
   <div class="row">
     <label><input type="checkbox" id="mirror" checked> 미러 보기</label>
-    <label style="margin-left:12px;">민감도 α: <input type="range" id="alpha" min="0.05" max="0.6" step="0.01" value="0.25"></label>
-    <label style="margin-left:12px;">데드밴드: <input type="range" id="dead" min="0" max="0.1" step="0.005" value="0.02"></label>
+    <!-- 기본값을 조금 더 안정적인 값으로 조정 -->
+    <label style="margin-left:12px;">민감도 α:
+      <input type="range" id="alpha" min="0.05" max="0.6" step="0.01" value="0.18">
+    </label>
+    <label style="margin-left:12px;">데드밴드:
+      <input type="range" id="dead" min="0" max="0.1" step="0.005" value="0.035">
+    </label>
   </div>
   <div class="angle">ANGLE: <span id="angleText">--</span>°</div>
-  <div class="hint">같은 Wi‑Fi에 연결된 노트북의 IP를 넣고 연결하세요. 예: ws://192.168.0.15:8765</div>
+  <div class="hint">
+    같은 Wi-Fi에 연결된 노트북의 IP를 넣고 연결하세요. 예: ws://192.168.0.15:8765<br>
+    (WebSocket은 나중에 ESP32/노트북 연동용이라, 연결 안 해도 얼굴 인식은 작동합니다)
+  </div>
 
 <script>
-let video = document.getElementById('video');
-let canvas = document.getElementById('canvas');
-let ctx = canvas.getContext('2d');
-let wsInput = document.getElementById('ws');
-let connectBtn = document.getElementById('connectBtn');
-let statusSpan = document.getElementById('status');
-let angleText = document.getElementById('angleText');
-let mirror = document.getElementById('mirror');
-let alphaInput = document.getElementById('alpha');
-let deadInput  = document.getElementById('dead');
+let video       = document.getElementById('video');
+let canvas      = document.getElementById('canvas');
+let ctx         = canvas.getContext('2d');
+let wsInput     = document.getElementById('ws');
+let connectBtn  = document.getElementById('connectBtn');
+let statusSpan  = document.getElementById('status');
+let angleText   = document.getElementById('angleText');
+let mirror      = document.getElementById('mirror');
+let alphaInput  = document.getElementById('alpha');
+let deadInput   = document.getElementById('dead');
 
 let cap, classifier, socket;
-let lastAngle = 90;
-let lastSend = 0;
+let lastAngle   = 90;
+let lastSend    = 0;
 
+// 안정화를 위한 변수들
+let stableFace  = null;   // {x,y,width,height} 최근 얼굴 위치
+let lostFrames  = 0;      // 얼굴 놓친 프레임 수
+
+// ───────── WebSocket 연결 ─────────
 connectBtn.onclick = () => {
-  if (socket && socket.readyState === 1) { socket.close(); return; }
+  if (socket && socket.readyState === 1) {
+    socket.close();
+    return;
+  }
   const url = wsInput.value.trim();
   if (!url) { alert("ws://<laptop_ip>:8765 형식으로 입력"); return; }
   socket = new WebSocket(url);
-  socket.onopen = () => { statusSpan.textContent = "연결됨"; connectBtn.textContent = "끊기"; };
+  socket.onopen  = () => { statusSpan.textContent = "연결됨"; connectBtn.textContent = "끊기"; };
   socket.onclose = () => { statusSpan.textContent = "끊어짐"; connectBtn.textContent = "연결"; };
-  socket.onerror = () => { statusSpan.textContent = "오류"; };
+  socket.onerror = () => { statusSpan.textContent = "오류";   };
 };
 
+// ───────── 카메라 초기화 ─────────
 async function initCamera(){
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "user" },
@@ -66,24 +83,21 @@ async function initCamera(){
   });
   video.srcObject = stream;
 
-  // 메타데이터(영상 크기) 로딩 기다리기
+  // 메타데이터(해상도) 로딩 기다리기
   await new Promise(r => video.onloadedmetadata = r);
 
-  // 비디오 요소의 width/height를 실제 영상 크기로 맞추기
+  // 비디오/캔버스 크기를 실제 해상도에 맞추기
   video.width  = video.videoWidth;
   video.height = video.videoHeight;
-
-  // 캔버스도 동일 크기로 맞추기
   canvas.width  = video.videoWidth;
   canvas.height = video.videoHeight;
 
-  // 이 상태에서 VideoCapture 생성
   cap = new cv.VideoCapture(video);
 }
 
-
+// ───────── 얼굴 분류기 로딩 ─────────
 async function initCascade(){
-  // 같은 폴더에 있는 파일을 직접 불러오기
+  // 같은 폴더에 있는 XML 파일 사용
   const xml = await fetch("haarcascade_frontalface_default.xml");
   const data = await xml.text();
   cv.FS_createDataFile("/", "face.xml", data, true, false);
@@ -91,57 +105,111 @@ async function initCascade(){
   classifier.load("face.xml");
 }
 
+// ───────── 각도 전송 ─────────
 function sendAngle(angle){
   const now = performance.now();
   if (!socket || socket.readyState !== 1) return;
-  if (now - lastSend < 80) return; // 전송 제한 (~12Hz)
+  if (now - lastSend < 80) return; // ~12Hz 제한
   lastSend = now;
-  const payload = JSON.stringify({type:"angle", value: Math.round(angle), ts: Date.now()});
+  const payload = JSON.stringify({
+    type:  "angle",
+    value: Math.round(angle),
+    ts:    Date.now()
+  });
   socket.send(payload);
 }
 
+// ───────── 메인 처리 루프 ─────────
 function process(){
-  const w = video.width; 
+  const w = video.width;
   const h = video.height;
   if (!w || !h) return requestAnimationFrame(process);
 
   const alpha = parseFloat(alphaInput.value);
   const dead  = parseFloat(deadInput.value);
 
-  let src = new cv.Mat(h, w, cv.CV_8UC4);
+  let src  = new cv.Mat(h, w, cv.CV_8UC4);
   let gray = new cv.Mat();
   cap.read(src);
   if (mirror.checked) cv.flip(src, src, 1);
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
 
   let faces = new cv.RectVector();
-  classifier.detectMultiScale(gray, faces, 1.1, 3, 0, new cv.Size(60,60));
 
+  // ✅ 더 안정적인 파라미터 (작은/애매한 얼굴은 무시)
+  // scaleFactor: 1.2, minNeighbors: 5, minSize: 80x80
+  classifier.detectMultiScale(
+    gray,
+    faces,
+    1.2,
+    5,
+    0,
+    new cv.Size(80, 80)
+  );
+
+  // 배경 영상 먼저 그림
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  if (faces.size() > 0){
+  let usedFace = null;
+
+  if (faces.size() > 0) {
+    // 가장 큰 얼굴 하나 선택 (가까운 사람)
     let best = faces.get(0);
-    for (let i=1;i<faces.size();i++){
+    for (let i = 1; i < faces.size(); i++) {
       const f = faces.get(i);
-      if (f.width*f.height > best.width*best.height) best = f;
+      if (f.width * f.height > best.width * best.height) {
+        best = f;
+      }
     }
-    ctx.lineWidth = 3; ctx.strokeStyle='red';
-    ctx.strokeRect(best.x, best.y, best.width, best.height);
+    // cv.Rect → 일반 객체로 복사 (메모리 삭제 후에도 쓰기 위해)
+    stableFace = {
+      x: best.x,
+      y: best.y,
+      width:  best.width,
+      height: best.height
+    };
+    lostFrames = 0;
+    usedFace = stableFace;
+  } else if (stableFace && lostFrames < 5) {
+    // 얼굴이 잠깐 사라져도 최근 얼굴을 5프레임 유지 → 화면 덜 튐
+    lostFrames++;
+    usedFace = stableFace;
+  } else {
+    // 얼굴 완전히 잃어버림
+    angleText.textContent = "--";
+  }
 
-    let cx = best.x + best.width/2;
-    let cNorm = cx / w;
-    let desired = cNorm * 180;
-    if (Math.abs(cNorm - 0.5) < dead) desired = lastAngle;
+  if (usedFace) {
+    // 빨간 박스 그리기
+    ctx.lineWidth   = 3;
+    ctx.strokeStyle = 'red';
+    ctx.strokeRect(usedFace.x, usedFace.y, usedFace.width, usedFace.height);
 
-    let smooth = lastAngle + alpha*(desired - lastAngle);
+    // 중심 x 좌표로 각도 계산
+    let cx    = usedFace.x + usedFace.width / 2;
+    let cNorm = cx / w;            // 0~1
+    let desired = cNorm * 180;     // 0~180
+
+    // 가운데 근처(데드밴드)에서는 변화 무시 → 덜 흔들림
+    if (Math.abs(cNorm - 0.5) < dead) {
+      desired = lastAngle;
+    }
+
+    // 부드럽게 보간
+    let smooth = lastAngle + alpha * (desired - lastAngle);
     lastAngle = smooth;
+
     angleText.textContent = Math.round(smooth);
     sendAngle(smooth);
   }
-  src.delete(); gray.delete(); faces.delete();
+
+  src.delete();
+  gray.delete();
+  faces.delete();
   requestAnimationFrame(process);
 }
 
+// OpenCV 로딩 완료 후 시작
 cv['onRuntimeInitialized'] = async () => {
   await initCamera();
   await initCascade();
